@@ -180,7 +180,7 @@ func TestRoundtripArraysAndNesting(t *testing.T) {
 
 // --- ADVANCED ROUNDTRIP TEST: Arrays and nested objects --- //
 func TestRoundtripNixJSON(t *testing.T) {
-	testJSON , err := os.ReadFile("nix.json")
+	testJSON, err := os.ReadFile("nix.json")
 
 	dataPath := writeTempFile(t, "testarray.json", string(testJSON))
 	defer removeFiles(dataPath)

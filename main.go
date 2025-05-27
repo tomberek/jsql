@@ -19,7 +19,7 @@ func main() {
 `, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
 		os.Exit(1)
 	}
-	
+
 	// Dispatch to the appropriate command
 	switch os.Args[1] {
 	case "analyze":

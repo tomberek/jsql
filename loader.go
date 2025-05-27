@@ -20,7 +20,7 @@ func InsertRow(tx *sql.Tx, table *TableSchema, obj map[string]interface{}, dbs *
 		if field == "id" {
 			continue
 		}
-		
+
 		// Symbol table lookups
 		if fk := table.FKs[field]; fk != "" && strings.HasSuffix(field, "_symbol") {
 			val := obj[strings.TrimSuffix(field, "_symbol")]

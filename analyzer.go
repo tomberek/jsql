@@ -9,8 +9,117 @@ import (
 	"strings"
 )
 
+// determineIndexes generates index definitions based on heuristics and options
+func determineIndexes(schema map[string]*TableSchema, symbolFields, symbolJSONFields map[string]bool, opts AnalyzeOptions) {
+	if !opts.GenerateIndexes {
+		return
+	}
+
+	// For each table in the schema
+	for _, ts := range schema {
+		// Track which fields we've already included in an index
+		indexedFields := make(map[string]bool)
+
+		// 1. Create indexes for foreign key fields
+		if opts.IndexFKs {
+			for fkField, _ := range ts.FKs {
+				// Skip id field as it's already a primary key
+				if fkField == "id" {
+					continue
+				}
+
+				// Create index for foreign key
+				idx := IndexDef{
+					Name:    fmt.Sprintf("idx_%s_%s", ts.Name, fkField),
+					Table:   ts.Name,
+					Columns: []string{fkField},
+					Unique:  false,
+				}
+				ts.Indexes = append(ts.Indexes, idx)
+				indexedFields[fkField] = true
+			}
+		}
+
+		// 2. Create indexes for symbol fields (these are high-cardinality fields that were converted to symbols)
+		if opts.IndexSymbols {
+			for field, _ := range ts.Fields {
+				symbolField := field + "_symbol"
+				if _, ok := ts.Fields[symbolField]; ok {
+					if !indexedFields[symbolField] {
+						idx := IndexDef{
+							Name:    fmt.Sprintf("idx_%s_%s", ts.Name, symbolField),
+							Table:   ts.Name,
+							Columns: []string{symbolField},
+							Unique:  false,
+						}
+						ts.Indexes = append(ts.Indexes, idx)
+						indexedFields[symbolField] = true
+					}
+				}
+			}
+		}
+	}
+
+	// Create indexes for symbol tables (always add these for efficient lookups)
+	if opts.IndexSymbols {
+		for field := range symbolFields {
+			if ts, ok := schema[field+"_symbol"]; ok {
+				// Symbol tables already have a unique index on 'value' due to UNIQUE constraint
+				// But we'll add an explicit index definition for clarity
+				idx := IndexDef{
+					Name:    fmt.Sprintf("idx_%s_value", field+"_symbol"),
+					Table:   field + "_symbol",
+					Columns: []string{"value"},
+					Unique:  true,
+				}
+				ts.Indexes = append(ts.Indexes, idx)
+			}
+		}
+
+		for field := range symbolJSONFields {
+			if _, already := symbolFields[field]; already {
+				continue // already output
+			}
+			if ts, ok := schema[field+"_symbol"]; ok {
+				idx := IndexDef{
+					Name:    fmt.Sprintf("idx_%s_value", field+"_symbol"),
+					Table:   field + "_symbol",
+					Columns: []string{"value"},
+					Unique:  true,
+				}
+				ts.Indexes = append(ts.Indexes, idx)
+			}
+		}
+	}
+}
+
+// AnalyzeOptions contains options for JSON analysis
+type AnalyzeOptions struct {
+	Sample          int  // Number of records to sample
+	GenerateIndexes bool // Whether to generate indexes
+	IndexFKs        bool // Whether to index foreign keys
+	IndexSymbols    bool // Whether to index symbol fields
+}
+
+// DefaultAnalyzeOptions returns the default options for analysis
+func DefaultAnalyzeOptions() AnalyzeOptions {
+	return AnalyzeOptions{
+		Sample:          20,
+		GenerateIndexes: true,
+		IndexFKs:        true,
+		IndexSymbols:    true,
+	}
+}
+
 // AnalyzeJSON analyzes a JSON file and returns a SQL DDL string
 func AnalyzeJSON(path string, sample int) string {
+	opts := DefaultAnalyzeOptions()
+	opts.Sample = sample
+	return AnalyzeJSONWithOptions(path, opts)
+}
+
+// AnalyzeJSONWithOptions analyzes a JSON file with custom options and returns a SQL DDL string
+func AnalyzeJSONWithOptions(path string, opts AnalyzeOptions) string {
 	f, err := os.Open(path)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "analyze: open:", err)
@@ -19,7 +128,7 @@ func AnalyzeJSON(path string, sample int) string {
 	defer f.Close()
 	sc := bufio.NewScanner(f)
 	var roots []map[string]interface{}
-	for n := 0; n < sample && sc.Scan(); n++ {
+	for n := 0; n < opts.Sample && sc.Scan(); n++ {
 		var rec map[string]interface{}
 		if json.Unmarshal(sc.Bytes(), &rec) == nil {
 			roots = append(roots, rec)
@@ -50,6 +159,9 @@ func AnalyzeJSON(path string, sample int) string {
 			symbolJSONFields[field] = true
 		}
 	}
+
+	// Generate indexes based on heuristics and options
+	determineIndexes(schema, symbolFields, symbolJSONFields, opts)
 
 	// Output DDL
 	var sb strings.Builder
@@ -93,6 +205,24 @@ func AnalyzeJSON(path string, sample int) string {
 		}
 		sb.WriteString(fmt.Sprintf("CREATE TABLE %s_symbol (\n  id INTEGER PRIMARY KEY,\n  value TEXT UNIQUE\n);\n\n", field))
 	}
+
+	// Emit CREATE INDEX statements
+	for _, tbl := range order {
+		ts := schema[tbl]
+		for _, idx := range ts.Indexes {
+			uniqueStr := ""
+			if idx.Unique {
+				uniqueStr = "UNIQUE "
+			}
+			columns := strings.Join(idx.Columns, ", ")
+			sb.WriteString(fmt.Sprintf("CREATE %sINDEX %s ON %s (%s);\n",
+				uniqueStr, idx.Name, idx.Table, columns))
+		}
+		if len(ts.Indexes) > 0 {
+			sb.WriteString("\n")
+		}
+	}
+
 	return sb.String()
 }
 
@@ -105,7 +235,12 @@ func analyzeObjectSymbol(
 	jsonUniques map[string]stringSet,
 ) {
 	if _, ok := schema[tblName]; !ok {
-		schema[tblName] = &TableSchema{Name: tblName, Fields: map[string]FieldType{}, FKs: map[string]string{}}
+		schema[tblName] = &TableSchema{
+			Name:    tblName,
+			Fields:  map[string]FieldType{},
+			FKs:     map[string]string{},
+			Indexes: []IndexDef{},
+		}
 	}
 	curr := schema[tblName]
 	fieldTypes := map[string]FieldType{}

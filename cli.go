@@ -12,14 +12,27 @@ func analyzeCmd(args []string) {
 	flags := flag.NewFlagSet("analyze", flag.ExitOnError)
 	var input string
 	var sample int
+	var generateIndexes, indexFKs, indexSymbols bool
+
 	flags.StringVar(&input, "input", "", "Line-delimited JSON input file")
 	flags.IntVar(&sample, "sample", 20, "How many rows to sample for schema inference")
+	flags.BoolVar(&generateIndexes, "indexes", true, "Generate indexes automatically")
+	flags.BoolVar(&indexFKs, "index-fks", true, "Generate indexes for foreign keys")
+	flags.BoolVar(&indexSymbols, "index-symbols", true, "Generate indexes for symbol fields")
+
 	flags.Parse(args)
 	if input == "" {
 		fmt.Fprintf(os.Stderr, "--input is required\n")
 		os.Exit(1)
 	}
-	fmt.Print(AnalyzeJSON(input, sample))
+
+	opts := DefaultAnalyzeOptions()
+	opts.Sample = sample
+	opts.GenerateIndexes = generateIndexes
+	opts.IndexFKs = indexFKs
+	opts.IndexSymbols = indexSymbols
+
+	fmt.Print(AnalyzeJSONWithOptions(input, opts))
 }
 
 func createDbCmd(args []string) {
@@ -97,16 +110,29 @@ func importCmd(args []string) {
 	flags := flag.NewFlagSet("import", flag.ExitOnError)
 	var input, dbFile, ddlFile string
 	var sample int
+	var generateIndexes, indexFKs, indexSymbols bool
+
 	flags.StringVar(&input, "input", "", "Line-delimited JSON input")
 	flags.StringVar(&dbFile, "db", "", "SQLite database output")
 	flags.StringVar(&ddlFile, "schema", "", "If supplied, write DDL to this file")
 	flags.IntVar(&sample, "sample", 20, "How many rows to sample for schema inference")
+	flags.BoolVar(&generateIndexes, "indexes", true, "Generate indexes automatically")
+	flags.BoolVar(&indexFKs, "index-fks", true, "Generate indexes for foreign keys")
+	flags.BoolVar(&indexSymbols, "index-symbols", true, "Generate indexes for symbol fields")
+
 	flags.Parse(args)
 	if input == "" || dbFile == "" {
 		fmt.Fprintln(os.Stderr, "--input and --db required")
 		os.Exit(1)
 	}
-	ddl := AnalyzeJSON(input, sample)
+
+	opts := DefaultAnalyzeOptions()
+	opts.Sample = sample
+	opts.GenerateIndexes = generateIndexes
+	opts.IndexFKs = indexFKs
+	opts.IndexSymbols = indexSymbols
+
+	ddl := AnalyzeJSONWithOptions(input, opts)
 	if ddlFile != "" {
 		if err := os.WriteFile(ddlFile, []byte(ddl), 0666); err != nil {
 			fmt.Fprintln(os.Stderr, "Write DDL:", err)
