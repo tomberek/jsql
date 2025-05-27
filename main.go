@@ -1,6 +1,7 @@
 package main
 
 import (
+        "bytes"
 	"bufio"
 	"database/sql"
 	"encoding/json"
@@ -118,63 +119,47 @@ func CreateDatabase(dbPath string, ddl string) error {
 }
 
 // --- Symbol Table Helper ---
+// Always marshals to JSON for consistency regardless of type
 func getOrInsertSymbol(tx *sql.Tx, symTable *TableSchema, val interface{}) (int64, error) {
 	if val == nil {
 		return 0, nil
 	}
-	var marshaled []byte
-	var toStore any
-
-	// Determine if the symbol table's "value" column is JSON or TEXT
-	isJSON := symTable.Fields["value"] == TypeJSON
-	if isJSON {
-		// Marshal to JSON for JSON symbols (including arrays/objects)
-		marshaled, _ = json.Marshal(val)
-		toStore = string(marshaled)
-	} else {
-		// Store as plain string
-		switch vv := val.(type) {
-		case string:
-			toStore = vv
-		default:
-			marshaled, _ = json.Marshal(vv)
-			toStore = string(marshaled)
-		}
-	}
+	js, _ := json.Marshal(val)
+	stored := string(js)
 
 	var id int64
-	err := tx.QueryRow(fmt.Sprintf("SELECT id FROM %s WHERE value = ?", symTable.Name), toStore).Scan(&id)
+	err := tx.QueryRow(
+		fmt.Sprintf("SELECT id FROM %s WHERE value = ?", symTable.Name),
+		stored,
+	).Scan(&id)
 	if err == sql.ErrNoRows {
-		_, err := tx.Exec(fmt.Sprintf("INSERT OR IGNORE INTO %s (value) VALUES (?)", symTable.Name), toStore)
+		_, err := tx.Exec(fmt.Sprintf("INSERT OR IGNORE INTO %s (value) VALUES (?)", symTable.Name), stored)
 		if err != nil {
 			return 0, err
 		}
-		err = tx.QueryRow(fmt.Sprintf("SELECT id FROM %s WHERE value = ?", symTable.Name), toStore).Scan(&id)
+		err = tx.QueryRow(fmt.Sprintf("SELECT id FROM %s WHERE value = ?", symTable.Name), stored).Scan(&id)
 		return id, err
 	}
-	if err != nil {
-		return 0, err
-	}
-	return id, nil
+	return id, err
 }
 
 func getSymbolValue(db *sql.DB, symTable string, id int64) (interface{}, error) {
 	var val string
-	err := db.QueryRow(fmt.Sprintf("SELECT value FROM %s WHERE id = ?", symTable), id).Scan(&val)
+	err := db.QueryRow(
+		fmt.Sprintf("SELECT value FROM %s WHERE id = ?", symTable), id,
+	).Scan(&val)
 	if err != nil {
 		return nil, err
 	}
-	// Try to unmarshal as JSON if possible
-	if len(val) > 0 && (val[0] == '[' || val[0] == '{') {
-		var v interface{}
-		if err := json.Unmarshal([]byte(val), &v); err == nil {
-			return v, nil
-		}
+	var v interface{}
+	if err := json.Unmarshal([]byte(val), &v); err == nil {
+		return v, nil
 	}
 	return val, nil
 }
 
 // --- Loader Core ---
+// Shorter, always uses consistent marshaling for arrays/objects
 func InsertRow(tx *sql.Tx, table *TableSchema, obj map[string]interface{}, dbs *DatabaseSchema) (int64, error) {
 	cols := []string{}
 	vals := []interface{}{}
@@ -183,11 +168,11 @@ func InsertRow(tx *sql.Tx, table *TableSchema, obj map[string]interface{}, dbs *
 		if field == "id" {
 			continue
 		}
-		// Symbol table lookup (works in ANY table!)
-		if strings.HasSuffix(field, "_symbol") && table.FKs[field] != "" {
-			base := strings.TrimSuffix(field, "_symbol")
-			val, _ := obj[base]
-			symTab := dbs.Tables[table.FKs[field]]
+		
+		// Symbol table lookups
+		if fk := table.FKs[field]; fk != "" && strings.HasSuffix(field, "_symbol") {
+			val := obj[strings.TrimSuffix(field, "_symbol")]
+			symTab := dbs.Tables[fk]
 			id, err := getOrInsertSymbol(tx, symTab, val)
 			if err != nil {
 				return 0, err
@@ -196,101 +181,59 @@ func InsertRow(tx *sql.Tx, table *TableSchema, obj map[string]interface{}, dbs *
 			vals = append(vals, id)
 			continue
 		}
-		// Nested table FK
-                // Inside InsertRow, in the section for foreign-key sub-tables:
-                if strings.HasSuffix(field, "_id") && table.FKs[field] != "" {
-                	base := strings.TrimSuffix(field, "_id")
-                	v, ok := obj[base]
-                	if ok {
-                		if nested, ok := v.(map[string]interface{}); ok && nested != nil {
-                			subTable := dbs.Tables[table.FKs[field]]
-                			// Build a SELECT to check for existing row
-                			subValues := make([]interface{}, 0)
-                			subColumns := make([]string, 0)
-                			for col := range subTable.Fields {
-                				if col == "id" {
-                					continue
-                				}
-                				if _, isSym := subTable.FKs[col]; isSym && strings.HasSuffix(col, "_symbol") {
-                					val, _ := nested[strings.TrimSuffix(col, "_symbol")].(string)
-                					symTab := dbs.Tables[subTable.FKs[col]]
-                					id, err := getOrInsertSymbol(tx, symTab, val)
-                					if err != nil {
-                						return 0, err
-                					}
-                					subValues = append(subValues, id)
-                				} else {
-                					val := nested[col]
-                					switch vv := val.(type) {
-                					case []interface{}, map[string]interface{}:
-                						js, _ := json.Marshal(vv)
-                						subValues = append(subValues, string(js))
-                					default:
-                						subValues = append(subValues, vv)
-                					}
-                				}
-                				subColumns = append(subColumns, col)
-                			}
-                			// Query for a row with all these columns
-                			conditions := []string{}
-                			for _, col := range subColumns {
-                				conditions = append(conditions, fmt.Sprintf("%s = ?", col))
-                			}
-                			query := fmt.Sprintf("SELECT id FROM %s WHERE %s", subTable.Name, strings.Join(conditions, " AND "))
-                			var subID int64
-                			err := tx.QueryRow(query, subValues...).Scan(&subID)
-                			if err == sql.ErrNoRows {
-                				// not found; insert as usual
-                				subID, err = InsertRow(tx, subTable, nested, dbs)
-                				if err != nil {
-                					return 0, err
-                				}
-                			} else if err != nil {
-                				return 0, err
-                			}
-                			cols = append(cols, field)
-                			vals = append(vals, subID)
-                			continue
-                		}
-                	}
-                	cols = append(cols, field)
-                	vals = append(vals, nil)
-                	continue
-                }
-		// Straight field
-		val, ok := obj[field]
+
+		// Nested subtable
+		if fk := table.FKs[field]; fk != "" && strings.HasSuffix(field, "_id") {
+			base := strings.TrimSuffix(field, "_id")
+			if v, ok := obj[base].(map[string]interface{}); ok && v != nil {
+				subTab := dbs.Tables[fk]
+				subID, err := InsertRow(tx, subTab, v, dbs)
+				if err != nil {
+					return 0, err
+				}
+				cols = append(cols, field)
+				vals = append(vals, subID)
+				continue
+			}
+			cols = append(cols, field)
+			vals = append(vals, nil)
+			continue
+		}
+
+		// Normal field
+		raw, ok := obj[field]
 		if !ok {
 			cols = append(cols, field)
 			vals = append(vals, nil)
 			continue
 		}
-		// If value is array or object, store as JSON string
-		switch vv := val.(type) {
+		switch raw.(type) {
 		case []interface{}, map[string]interface{}:
-			js, _ := json.Marshal(vv)
+			js, _ := json.Marshal(raw)
 			cols = append(cols, field)
 			vals = append(vals, string(js))
 		default:
 			cols = append(cols, field)
-			vals = append(vals, vv)
+			vals = append(vals, raw)
 		}
 	}
+
 	if len(cols) == 0 {
-		return 0, nil // nothing to insert
+		return 0, nil
 	}
-	phs := make([]string, len(cols))
-	for i := range cols {
-		phs[i] = "?"
-	}
-	stmt := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", table.Name, strings.Join(cols, ", "), strings.Join(phs, ", "))
-	res, err := tx.Exec(stmt, vals...)
+	q := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
+		table.Name,
+		strings.Join(cols, ", "),
+		strings.TrimRight(strings.Repeat("?,", len(cols)), ","),
+	)
+	res, err := tx.Exec(q, vals...)
 	if err != nil {
 		return 0, fmt.Errorf("insert %s: %v (cols=%v vals=%v)", table.Name, err, cols, vals)
 	}
 	return res.LastInsertId()
 }
 
-func LoadData(jsonPath string, dbPath string, dbs *DatabaseSchema) error {
+func LoadData(jsonPath, dbPath string, dbs *DatabaseSchema) error {
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return err
@@ -308,29 +251,26 @@ func LoadData(jsonPath string, dbPath string, dbs *DatabaseSchema) error {
 	if err != nil {
 		return err
 	}
-
 	mainTable := dbs.Tables["main"]
+
 	lineNum := 0
 	for scanner.Scan() {
 		lineNum++
-		if strings.TrimSpace(scanner.Text()) == "" {
+		line := scanner.Bytes()
+		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 		var obj map[string]interface{}
-		if err := json.Unmarshal(scanner.Bytes(), &obj); err != nil {
+		if err := json.Unmarshal(line, &obj); err != nil {
 			fmt.Fprintf(os.Stderr, "skip JSON line %d: %v\n", lineNum, err)
 			continue
 		}
-		_, err := InsertRow(tx, mainTable, obj, dbs)
-		if err != nil {
+		if _, err := InsertRow(tx, mainTable, obj, dbs); err != nil {
 			fmt.Fprintf(os.Stderr, "Load row %d: %v\n", lineNum, err)
 			continue
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	return nil
+	return tx.Commit()
 }
 
 func dumpRowByID(db *sql.DB, dbs *DatabaseSchema, table *TableSchema, id int64) (map[string]interface{}, error) {
