@@ -1,0 +1,42 @@
+{
+  "nodes": {
+    "cook": {
+      "locked": {
+        "lastModified": 1724655007,
+        "narHash": "sha256-L4fIUhZzPUaWPgczP5QNTMNhe3rH0PGwNVg7CposQEk=",
+        "owner": "tomberek",
+        "repo": "cook",
+        "rev": "ea67a20d3bd65164c60bb41cedaeb67fbf6c92fb",
+        "type": "github"
+      },
+      "original": {
+        "owner": "tomberek",
+        "repo": "cook",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1748381338,
+        "narHash": "sha256-OYUeQEF8MtB8+t8+Llomz1E6Pg5b4gL/bhuyCn6V6RY=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "f870c6ccc8951fc48aeb293cf3e98ade6ac42668",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "cook": "cook",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
