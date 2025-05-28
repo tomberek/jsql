@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -73,20 +74,46 @@ func decodeAllLines(t *testing.T, b []byte) []map[string]interface{} {
 	return res
 }
 
-// --- BASIC Roundtrip Example from previous test --- //
-func TestImportAllAndDump(t *testing.T) {
-	const testJSON = `
-{"name": "Alice", "age": 30, "meta": {"city":"Wonderland"}}
-{"name": "Bob", "age": 31, "meta": {"city":"Builderland"}}
-{"name": "Carol", "age": 25, "meta": {"city":"Charleston"}}
-`
-	dataPath := writeTempFile(t, "testdata.json", testJSON)
-	defer removeFiles(dataPath)
+// Common roundtrip test function that processes JSON data through SQLite and back
+func roundtripTest(t *testing.T, testJSON string, testFile string, testName string, validateSchema func(string, *testing.T)) {
+	var content []byte
+	var err error
+	
+	if testJSON != "" {
+		// Use inline JSON
+		content = []byte(testJSON)
+	} else if testFile != "" {
+		// Read from file
+		_, err := os.Stat(testFile)
+		if os.IsNotExist(err) {
+			t.Skipf("%s not found, skipping test", testFile)
+			return
+		}
+		
+		content, err = os.ReadFile(testFile)
+		if err != nil {
+			t.Fatalf("Failed to read test file: %v", err)
+			return
+		}
+	} else {
+		t.Fatal("Either testJSON or testFile must be provided")
+		return
+	}
+	
+	// Create temp file if using inline JSON
+	var dataPath string
+	if testJSON != "" {
+		dataPath = writeTempFile(t, "test-"+testName+".json", testJSON)
+		defer removeFiles(dataPath)
+	} else {
+		dataPath = testFile
+	}
 
+	// Setup paths
 	tmp := t.TempDir()
-	dbPath := filepath.Join(tmp, "test-importall.db")
-	ddlPath := filepath.Join(tmp, "test-importall.sql")
-	binPath := filepath.Join(tmp, "clihelper")
+	dbPath := filepath.Join(tmp, "test-"+testName+".db")
+	ddlPath := filepath.Join(tmp, "test-"+testName+".sql")
+	binPath := filepath.Join(tmp, "cli-"+testName)
 
 	// Build CLI
 	if out, err := exec.Command("go", "build", "-o", binPath, ".").CombinedOutput(); err != nil {
@@ -94,34 +121,99 @@ func TestImportAllAndDump(t *testing.T) {
 	}
 	defer removeFiles(binPath)
 
-	cmd := exec.Command(binPath, "import", "--input", dataPath, "--db", dbPath, "--schema", ddlPath)
+	// Import data
+	cmd := exec.Command(binPath, "import", 
+		"--input", dataPath, 
+		"--db", dbPath, 
+		"--schema", ddlPath)
+	
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("import: %v\n%s", err, out)
 	}
 
-	// Dump
+	// Examine schema if validator provided
+	if validateSchema != nil {
+		schemaDDL, err := os.ReadFile(ddlPath)
+		if err != nil {
+			t.Fatalf("Failed to read schema: %v", err)
+		}
+		validateSchema(string(schemaDDL), t)
+	}
+
+	// Dump data
 	cmd = exec.Command(binPath, "dump", "--db", dbPath, "--schema", ddlPath)
 	dumpOut, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("dump: %v", err)
 	}
 
+	// Parse output
 	got := decodeAllLines(t, dumpOut)
 
-	// Parse the source, to compare as data
-	srcRaw := bytes.Split([]byte(testJSON), []byte{'\n'})
+	// Parse original input
+	srcRaw := bytes.Split(content, []byte{'\n'})
 	var want []map[string]interface{}
 	for _, l := range srcRaw {
 		if len(bytes.TrimSpace(l)) == 0 {
 			continue
 		}
 		var m map[string]interface{}
-		json.Unmarshal(l, &m)
+		if err := json.Unmarshal(l, &m); err != nil {
+			t.Fatalf("Failed to unmarshal source JSON: %v", err)
+		}
 		want = append(want, m)
 	}
-	if !reflect.DeepEqual(normalizeJSON(got), normalizeJSON(want)) {
-		t.Errorf("roundtrip mismatch\nGOT: %+v\nWANT: %+v", got, want)
+
+	// Compare data
+	normGot := normalizeJSON(got)
+	normWant := normalizeJSON(want)
+
+	// Check record count
+	if len(normGot) != len(normWant) {
+		t.Errorf("Record count mismatch: got %d, want %d", len(normGot), len(normWant))
 	}
+
+	// Deep comparison
+	if !reflect.DeepEqual(normGot, normWant) {
+		// Detailed comparison to find differences
+		for i, w := range normWant {
+			if i >= len(normGot) {
+				t.Errorf("Missing record at index %d", i)
+				continue
+			}
+			g := normGot[i]
+			
+			// Compare each field
+			for k, wv := range w {
+				gv, exists := g[k]
+				if !exists {
+					t.Errorf("Record %d: Missing field %q", i, k)
+					continue
+				}
+				
+				// Special handling for deeply nested structures
+				if !reflect.DeepEqual(gv, wv) {
+					t.Errorf("Record %d, field %q: values don't match\nGot: %#v\nWant: %#v", 
+						i, k, gv, wv)
+				}
+			}
+		}
+		
+		t.Errorf("%s roundtrip failed", testName)
+	} else {
+		t.Logf("Successfully preserved %d records through SQLite roundtrip for %s test", 
+			len(normWant), testName)
+	}
+}
+
+// --- BASIC Roundtrip Example --- //
+func TestImportAllAndDump(t *testing.T) {
+	const testJSON = `
+{"name": "Alice", "age": 30, "meta": {"city":"Wonderland"}}
+{"name": "Bob", "age": 31, "meta": {"city":"Builderland"}}
+{"name": "Carol", "age": 25, "meta": {"city":"Charleston"}}
+`
+	roundtripTest(t, testJSON, "", "basic", nil)
 }
 
 // --- ADVANCED ROUNDTRIP TEST: Arrays and nested objects --- //
@@ -131,100 +223,48 @@ func TestRoundtripArraysAndNesting(t *testing.T) {
 {"type": "B", "ids": [], "sub": {"foo": "baz", "val": 7.1}}
 {"type": "C", "ids": [17], "sub": {"foo": "qux", "val": 0}}
 `
-	dataPath := writeTempFile(t, "testarray.json", testJSON)
-	defer removeFiles(dataPath)
-
-	tmp := t.TempDir()
-	dbPath := filepath.Join(tmp, "test-arrays.db")
-	ddlPath := filepath.Join(tmp, "test-arrays.sql")
-	binPath := filepath.Join(tmp, "cliarray")
-
-	// Build CLI (again)
-	if out, err := exec.Command("go", "build", "-o", binPath, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
-	defer removeFiles(binPath)
-
-	// Import all
-	cmd := exec.Command(binPath, "import", "--input", dataPath, "--db", dbPath, "--schema", ddlPath)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("import: %v\n%s", err, out)
-	}
-
-	// Dump
-	cmd = exec.Command(binPath, "dump", "--db", dbPath, "--schema", ddlPath)
-	dumpOut, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("dump: %v", err)
-	}
-
-	got := decodeAllLines(t, dumpOut)
-
-	// Parse input as data
-	srcRaw := bytes.Split([]byte(testJSON), []byte{'\n'})
-	var want []map[string]interface{}
-	for _, l := range srcRaw {
-		if len(bytes.TrimSpace(l)) == 0 {
-			continue
-		}
-		var m map[string]interface{}
-		json.Unmarshal(l, &m)
-		want = append(want, m)
-	}
-	normGot := normalizeJSON(got)
-	normWant := normalizeJSON(want)
-	if !reflect.DeepEqual(normGot, normWant) {
-		t.Errorf("array/nested roundtrip mismatch\nGOT: %+v\nWANT: %+v", normGot, normWant)
-	}
+	roundtripTest(t, testJSON, "", "arrays", nil)
 }
 
-// --- ADVANCED ROUNDTRIP TEST: Arrays and nested objects --- //
+// --- ADVANCED ROUNDTRIP TEST: External Nix JSON --- //
 func TestRoundtripNixJSON(t *testing.T) {
-	testJSON , err := os.ReadFile("nix.json")
-
-	dataPath := writeTempFile(t, "testarray.json", string(testJSON))
-	defer removeFiles(dataPath)
-
-	tmp := t.TempDir()
-	dbPath := filepath.Join(tmp, "test-arrays.db")
-	ddlPath := filepath.Join(tmp, "test-arrays.sql")
-	binPath := filepath.Join(tmp, "cliarray")
-
-	// Build CLI (again)
-	if out, err := exec.Command("go", "build", "-o", binPath, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
+	validateSchema := func(schema string, t *testing.T) {
+		tableCount := strings.Count(schema, "CREATE TABLE")
+		t.Logf("Nix JSON schema contains %d tables", tableCount)
 	}
-	defer removeFiles(binPath)
+	
+	roundtripTest(t, "", "nix.json", "nix", validateSchema)
+}
 
-	// Import all
-	cmd := exec.Command(binPath, "import", "--input", dataPath, "--db", dbPath, "--schema", ddlPath)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("import: %v\n%s", err, out)
+// --- SIMPLE ROUNDTRIP TEST --- //
+func TestRoundtripSimpleStructures(t *testing.T) {
+	validateSchema := func(schema string, t *testing.T) {
+		tableCount := strings.Count(schema, "CREATE TABLE")
+		t.Logf("Schema contains %d tables", tableCount)
 	}
+	
+	roundtripTest(t, "", "test_simple.json", "simple", validateSchema)
+}
 
-	// Dump
-	cmd = exec.Command(binPath, "dump", "--db", dbPath, "--schema", ddlPath)
-	dumpOut, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("dump: %v", err)
+// --- MODERATE COMPLEXITY ROUNDTRIP TEST --- //
+func TestRoundtripModerateStructures(t *testing.T) {
+	validateSchema := func(schema string, t *testing.T) {
+		tableCount := strings.Count(schema, "CREATE TABLE")
+		t.Logf("Schema contains %d tables", tableCount)
 	}
+	
+	roundtripTest(t, "", "test_moderate.json", "moderate", validateSchema)
+}
 
-	got := decodeAllLines(t, dumpOut)
-
-	// Parse input as data
-	srcRaw := bytes.Split([]byte(testJSON), []byte{'\n'})
-	var want []map[string]interface{}
-	for _, l := range srcRaw {
-		if len(bytes.TrimSpace(l)) == 0 {
-			continue
-		}
-		var m map[string]interface{}
-		json.Unmarshal(l, &m)
-		want = append(want, m)
+// --- HIGH COMPLEXITY ROUNDTRIP TEST --- //
+func TestRoundtripHighComplexity(t *testing.T) {
+	validateSchema := func(schema string, t *testing.T) {
+		tableCount := strings.Count(schema, "CREATE TABLE")
+		t.Logf("Schema contains %d tables for highly complex data", tableCount)
+		
+		indexCount := strings.Count(schema, "CREATE INDEX")
+		t.Logf("Schema contains %d indexes", indexCount)
 	}
-	normGot := normalizeJSON(got)
-	normWant := normalizeJSON(want)
-	if !reflect.DeepEqual(normGot, normWant) {
-		t.Errorf("array/nested roundtrip mismatch\nGOT: %+v\nWANT: %+v", normGot, normWant)
-	}
+	
+	roundtripTest(t, "", "test_high_revised.json", "high-complex", validateSchema)
 }
