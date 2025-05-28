@@ -1,0 +1,3 @@
+{"id": "doc1", "title": "Simple Document", "metadata": {"author": "Jane Smith", "created": "2023-05-15T10:30:00Z"}, "tags": ["documentation", "tutorial"]}
+{"id": "doc2", "title": "Another Document", "metadata": {"author": "Alex Johnson", "created": "2023-06-20T14:45:00Z"}, "tags": ["software", "development"]}
+{"id": "doc3", "title": "Data Structures", "metadata": {"author": "Carlos Rodriguez", "created": "2023-07-10T09:15:00Z"}, "tags": ["data", "algorithms"]}
